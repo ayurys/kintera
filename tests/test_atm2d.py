@@ -1,3 +1,4 @@
+import math
 import functools
 from pathlib import Path
 
@@ -772,3 +773,279 @@ def test_cuda_sparse_solver_reuses_cached_int32_csr_indices():
 
     assert crow1.data_ptr() == crow3.data_ptr() == crow4.data_ptr()
     assert col1.data_ptr() == col3.data_ptr() == col4.data_ptr()
+
+
+def test_newton_implicit_step_honors_mr_transport_form():
+    """``newton_implicit_step`` shall forward ``density``/``transport_form``
+    down to the transport operator.
+
+    Regression: both arguments were previously absent from this entry
+    point, so every coupled Newton solve silently used the concentration
+    form -- ``density`` reached ``build_implicit_step_system`` as ``None``,
+    which both suppressed the mixing-ratio default and made an explicit
+    request via ``KINTERA_TRANSPORT_FORM`` raise. The two forms disagree
+    on a variable-density column, so this pinned the coupled solver away
+    from the discretization that references like VULCAN/KINETICS-base use.
+
+    Discriminating setup: a column with uniform mixing ratio has zero
+    mixing-ratio-form flux, so an mr BE step is a no-op, while the
+    concentration form spuriously redistributes mass down the density
+    gradient.
+    """
+    from kintera.atm2d.newton.coupled import newton_implicit_step
+
+    ncol, nlyr, ns = 1, 6, 2
+    x1f = torch.linspace(0.0, 6.0e5, nlyr + 1, dtype=torch.float64)
+    x2f = torch.tensor([0.0, 1.0], dtype=torch.float64)
+    temp = torch.full((ncol, nlyr), 250.0, dtype=torch.float64)
+    pres = torch.logspace(5.0, 3.0, nlyr, dtype=torch.float64).unsqueeze(0)
+    z = 0.5 * (x1f[:-1] + x1f[1:])
+    density = (1.0e15 * torch.exp(-z / 1.0e5)).unsqueeze(0).contiguous()
+    chi = torch.tensor([0.3, 0.7], dtype=torch.float64)
+    conc = density.unsqueeze(-1) * chi.view(1, 1, ns)
+    kzz = torch.full((ncol, nlyr), 1.0e5, dtype=torch.float64)
+
+    def step(form, dens):
+        state = kt.AtmState2D(
+            x1f=x1f, x2f=x2f, temperature=temp, pressure=pres,
+            concentration=conc.clone(),
+        )
+        result = newton_implicit_step(
+            state, 1.0e3, kzz=kzz, source_terms=None,
+            density=dens, transport_form=form, max_iterations=5,
+        )
+        return (result.concentration - conc).abs().max().item()
+
+    scale = conc.abs().max().item()
+    # mr form: uniform mixing ratio => no transport at all.
+    assert step("mr_diffusion", density) < 1e-12 * scale
+    # c form: same input moves mass => the two forms are genuinely
+    # distinguishable here, so the assertion above has teeth.
+    assert step("c_diffusion", None) > 1e-6 * scale
+
+
+def test_newton_implicit_step_restores_state_on_non_finite_iterate():
+    """A Newton step that diverges to non-finite shall leave
+    ``state.concentration`` untouched.
+
+    Regression: the non-finite early-return assigned the bad iterate to
+    ``state.concentration`` and returned without restoring the entry
+    value, while every other exit path restores it. That breaks the
+    contract ``adaptive_advance`` documents and depends on ("on
+    rejection the state is left untouched"): the controller shrinks dt
+    and retries, but each retry then starts from NaN, so one
+    recoverable rejection cascades until dt hits the floor and the whole
+    advance raises.
+    """
+    from kintera.atm2d.newton.coupled import newton_implicit_step
+
+    ncol, nlyr, ns = 1, 3, 2
+    state = _make_state(ncol=ncol, nlyr=nlyr, ns=ns)
+    state.concentration = torch.ones(ncol, nlyr, ns, dtype=state.dtype)
+    entry = state.concentration.clone()
+    kzz = torch.zeros((ncol, nlyr), dtype=state.dtype)
+
+    class Diverging:
+        """Source whose linearization is non-finite, forcing the bail-out."""
+
+        def linearize(self, source_state):
+            return kt.LocalSourceLinearization(
+                tendency=torch.full_like(source_state.concentration, float("nan")),
+                jacobian=torch.zeros(
+                    (ncol, nlyr, ns, ns), dtype=source_state.dtype
+                ),
+            )
+
+    result = newton_implicit_step(
+        state, 1.0, kzz=kzz, source_terms=[Diverging()], max_iterations=3
+    )
+
+    assert not result.converged
+    assert not torch.isfinite(result.concentration).all()
+    # The failure must not leak into the caller's state.
+    assert torch.isfinite(state.concentration).all()
+    torch.testing.assert_close(state.concentration, entry, atol=0.0, rtol=0.0)
+
+
+def test_affine_with_identity_matches_dense_construction():
+    """``affine_with_identity`` is the sparse form of the BE matrix assembly.
+
+    ``build_implicit_step_system`` used to build ``coeff*I + scale*L`` as
+    ``from_dense(coeff * torch.eye(n) - operator.global_csr.to_dense())``,
+    which is O(nstate^2) in time and memory for an O(nnz) operation. This
+    pins the sparse replacement to the dense result exactly, including the
+    case where the operator already stores diagonal entries (which must be
+    summed with the identity contribution, not overwritten).
+    """
+    import torch
+
+    from kintera.atm2d.matrix import SparseSystemMatrix
+
+    torch.manual_seed(7)
+    ncol, nlyr, nspecies = 2, 5, 3
+    n = ncol * nlyr * nspecies
+
+    dense = torch.zeros(n, n, dtype=torch.float64)
+    rows = torch.randint(0, n, (4 * n,))
+    cols = torch.randint(0, n, (4 * n,))
+    dense[rows, cols] = torch.randn(4 * n, dtype=torch.float64)
+    # ensure the operator carries its own diagonal entries
+    diag = torch.arange(n)
+    dense[diag, diag] = torch.randn(n, dtype=torch.float64)
+
+    operator = SparseSystemMatrix.from_dense(
+        dense, ncol=ncol, nlyr=nlyr, nspecies=nspecies
+    )
+    eye = torch.eye(n, dtype=torch.float64)
+    for scale, coeff in ((-1.0, 1e-3), (-100.0, 1.0), (2.5, -0.5)):
+        expected = coeff * eye + scale * operator.global_csr.to_dense()
+        got = operator.affine_with_identity(scale, coeff).global_csr.to_dense()
+        assert torch.equal(got, expected), (scale, coeff)
+
+
+def test_build_implicit_step_system_matches_dense_reference():
+    """End-to-end: the assembled BE system equals the old dense formula.
+
+    Covers both branches of the dt-conditional rescaling in
+    ``build_implicit_step_system`` (``dt >= 1`` uses ``I/dt - L``, ``dt < 1``
+    uses ``I - dt*L``).
+    """
+    import torch
+
+    from kintera.atm2d.assembly import build_implicit_step_system
+
+    torch.manual_seed(11)
+    ncol, nlyr, nspecies = 1, 6, 4
+    state = _make_state(ncol=ncol, nlyr=nlyr, ns=nspecies)
+    state.concentration = (
+        torch.rand(ncol, nlyr, nspecies, dtype=torch.float64) + 0.5
+    )
+    kzz = torch.full((ncol, nlyr), 1.0e5, dtype=torch.float64)
+
+    for dt in (1.0e-3, 10.0):
+        system, _ = build_implicit_step_system(state, kzz, dt)
+        # rebuild the operator alone and apply the old dense formula
+        from kintera.atm2d.assembly import build_implicit_operator
+
+        operator = build_implicit_operator(state, kzz)
+        n = operator.nstate
+        eye = torch.eye(n, dtype=torch.float64)
+        if dt >= 1.0:
+            expected = (1.0 / dt) * eye - operator.global_csr.to_dense()
+        else:
+            expected = eye - dt * operator.global_csr.to_dense()
+        assert torch.equal(system.global_csr.to_dense(), expected), dt
+
+
+def _decay_source(rate):
+    """Linear decay dc/dt = -rate * c, whose exact solution is c0*exp(-rate*t)."""
+
+    class Decay:
+        def linearize(self, source_state):
+            c = source_state.concentration
+            tendency = -rate * c
+            eye = torch.eye(c.shape[-1], dtype=c.dtype).expand(
+                c.shape[0], c.shape[1], c.shape[-1], c.shape[-1]
+            )
+            return kt.LocalSourceLinearization(tendency=tendency, jacobian=-rate * eye)
+
+    return Decay()
+
+
+def test_rosenbrock2_is_second_order_accurate():
+    """Ros2 must show ~2nd-order convergence on a problem with an exact solution.
+
+    Uses pure linear decay with Kzz = 0 so transport contributes nothing and
+    the answer is c0*exp(-rate*t). Halving dt should cut the error ~4x; a
+    first-order scheme (or a mis-transcribed Rosenbrock coefficient) would
+    show ~2x and fail here.
+    """
+    from kintera.atm2d import rosenbrock2_step
+
+    rate = 0.7
+    t_end = 1.0
+    state = _make_state(ncol=1, nlyr=3, ns=2)
+    c0 = torch.full_like(state.concentration, 1.0)
+    kzz = torch.zeros((1, 3), dtype=torch.float64)
+
+    errors = []
+    for nsteps in (8, 16, 32, 64):
+        state.concentration = c0.clone()
+        dt = t_end / nsteps
+        for _ in range(nsteps):
+            res = rosenbrock2_step(
+                state, dt, kzz=kzz, source_terms=[_decay_source(rate)]
+            )
+            assert res.finite
+            state.concentration = res.concentration
+        exact = c0 * math.exp(-rate * t_end)
+        errors.append(float((state.concentration - exact).abs().max()))
+
+    for coarse, fine in zip(errors, errors[1:]):
+        order = math.log2(coarse / fine)
+        assert 1.8 < order < 2.2, (order, errors)
+
+
+def test_rosenbrock2_leaves_entry_state_untouched():
+    """The step must not mutate ``state`` -- stage 2 parks y2 there internally.
+
+    ``adaptive_advance`` retries a rejected step from the entry state, so a
+    leaked intermediate would corrupt every subsequent attempt.
+    """
+    from kintera.atm2d import rosenbrock2_step
+
+    state = _make_state(ncol=1, nlyr=4, ns=2)
+    entry = state.concentration.clone()
+    kzz = torch.full((1, 4), 1.0e5, dtype=torch.float64)
+    res = rosenbrock2_step(state, 10.0, kzz=kzz, source_terms=[_decay_source(0.3)])
+    assert res.finite
+    assert torch.equal(state.concentration, entry)
+    assert not torch.equal(res.concentration, entry)
+
+
+def test_layer_relative_floor_ignores_trace_species_per_layer():
+    """No single absolute floor can serve a column spanning many decades.
+
+    Two layers, 1e22 and 1e10 cm^-3, each with one abundant species that does
+    not move and one dust-level species that doubles. The dust should never
+    decide convergence; the abundant species always should.
+    """
+    from kintera.atm2d import per_species_relative_change
+
+    old = torch.tensor([[[1.0e22, 1.0e4], [1.0e10, 1.0e-8]]], dtype=torch.float64)
+    new = torch.tensor([[[1.0e22, 2.0e4], [1.0e10, 2.0e-8]]], dtype=torch.float64)
+
+    # Absolute floor small enough for the top layer: the deep layer's dust
+    # doubles and pins the maximum at 1.0, reporting non-convergence.
+    assert per_species_relative_change(
+        new, old, species_scale_floor=1.0) == pytest.approx(1.0)
+
+    # Absolute floor large enough to silence the deep dust: now a real 50%
+    # change in the *top* layer's abundant species reads as 5e-3, so the test
+    # has gone blind to genuine chemistry there.
+    moved_top = new.clone()
+    moved_top[0, 1, 0] = 1.5e10
+    assert per_species_relative_change(
+        moved_top, old, species_scale_floor=1.0e12) == pytest.approx(5.0e-3)
+
+    # Relative floor: silences the dust in both layers at once...
+    assert per_species_relative_change(
+        new, old, species_scale_floor=1.0,
+        layer_relative_floor=1.0e-10) == pytest.approx(1.0e-8)
+
+    # ...while still reporting the real 50% change at full weight.
+    assert per_species_relative_change(
+        moved_top, old, species_scale_floor=1.0,
+        layer_relative_floor=1.0e-10) == pytest.approx(0.5)
+
+
+def test_layer_relative_floor_defaults_to_previous_behaviour():
+    """Default (0.0) must reproduce the pure absolute-floor semantics."""
+    from kintera.atm2d import per_species_relative_change
+
+    old = torch.tensor([[[1.0e12, 0.0]]], dtype=torch.float64)
+    new = torch.tensor([[[1.0e12, 1.0e3]]], dtype=torch.float64)
+    a = per_species_relative_change(new, old, species_scale_floor=1.0)
+    b = per_species_relative_change(new, old, species_scale_floor=1.0,
+                                    layer_relative_floor=0.0)
+    assert a == b == pytest.approx(1.0e3)
