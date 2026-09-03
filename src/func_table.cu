@@ -28,6 +28,8 @@ __device__ user_func1 func1_table_cuda[] = {
     co2_antoine_ddT,
     kcl_lodders,
     kcl_lodders_ddT,
+    zns_visscher,
+    zns_visscher_ddT,
     na_h2s_visscher,
     na_h2s_visscher_ddT
 };

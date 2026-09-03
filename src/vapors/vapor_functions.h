@@ -175,18 +175,27 @@ inline double co2_antoine_ddT(double T) {
 
 DISPATCH_MACRO
 inline double kcl_lodders(double T) {
-  double logp = 7.611 - 11382. / T;
-  return log(1.E5) + logp;
+  double logp = 32.53 - 40615. / T;
+  return logp;
 }
 
 DISPATCH_MACRO
-inline double kcl_lodders_ddT(double T) { return 11382. / (T * T); }
+inline double kcl_lodders_ddT(double T) { return 40615. / (T * T); }
+
+DISPATCH_MACRO
+inline double zns_visscher(double T) {
+  double logp = 13.24 - 15873. / T;
+  return logp * log(10.);
+}
+
+DISPATCH_MACRO
+inline double zns_visscher_ddT(double T) { return 15873.* log(10.) / (T * T); }
 
 DISPATCH_MACRO
 inline double na_h2s_visscher(double T) {
   // double log10p = 8.55 - 13889. / T - 0.5 * log10(pH2S / 1E5);
   // return 1.E5 * pow(10., log10p);
-  double a = 8.55;
+  double a = 3.74;
   double b = 13889.;
   return (15. + 2. * a - 2. * b / T) * log(10.);
 }
